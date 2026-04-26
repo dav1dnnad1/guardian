@@ -40,7 +40,7 @@ How to talk to ${name}:
 - Keep responses focused and actionable. No filler.
 - Add +XP mentions occasionally to reinforce the game layer (e.g. "That's +50 XP for completing the workout")
 
-You have full context of everything they've logged. Use it.`;
+You have full context of everything they have logged. Use it.`;
 }
 
 async function callAnthropic(messages: Array<{role: string; content: string}>, system: string): Promise<string> {
@@ -52,13 +52,18 @@ async function callAnthropic(messages: Array<{role: string; content: string}>, s
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
       system,
       messages,
     }),
   });
-  if (!res.ok) throw new Error(`Anthropic error: ${res.status}`);
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Anthropic error ${res.status}: ${errBody}`);
+  }
+
   const data = await res.json();
   return data.content?.filter((b: {type: string}) => b.type === 'text').map((b: {text: string}) => b.text).join('') || '';
 }
@@ -80,7 +85,10 @@ async function callGemini(messages: Array<{role: string; content: string}>, syst
       }),
     }
   );
-  if (!res.ok) throw new Error(`Gemini error: ${res.status}`);
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Gemini error ${res.status}: ${errBody}`);
+  }
   const data = await res.json();
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
@@ -98,15 +106,32 @@ async function callGroq(messages: Array<{role: string; content: string}>, system
       max_tokens: 1024,
     }),
   });
-  if (!res.ok) throw new Error(`Groq error: ${res.status}`);
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Groq error ${res.status}: ${errBody}`);
+  }
   const data = await res.json();
   return data.choices?.[0]?.message?.content || '';
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const { messages, context, profile } = await request.json();
+    const body = await request.json();
+    const { messages, context, profile } = body;
+
+    if (!messages || !Array.isArray(messages)) {
+      return NextResponse.json({ error: 'Invalid request: messages array required.' }, { status: 400 });
+    }
+
     const provider = getProvider();
+
+    if (provider === 'anthropic' && !ANTHROPIC_KEY) {
+      return NextResponse.json(
+        { error: 'No API key found. Add ANTHROPIC_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in Vercel → Settings → Environment Variables, then redeploy.' },
+        { status: 500 }
+      );
+    }
+
     const system = buildSystemPrompt(context || {}, profile || {});
 
     let text = '';
@@ -116,8 +141,13 @@ export async function POST(request: NextRequest) {
       else if (provider === 'groq') text = await callGroq(messages, system);
     } catch (providerError) {
       console.error(`${provider} failed:`, providerError);
+      // fallback chain
       if (provider === 'anthropic' && GEMINI_KEY) {
+        console.log('Falling back to Gemini...');
         text = await callGemini(messages, system);
+      } else if (provider === 'anthropic' && GROQ_KEY) {
+        console.log('Falling back to Groq...');
+        text = await callGroq(messages, system);
       } else {
         throw providerError;
       }
@@ -132,10 +162,12 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json({ message: text, timetableEdit, provider });
+
   } catch (error) {
-    console.error('Guardian chat error:', error);
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    console.error('Guardian chat error:', message);
     return NextResponse.json(
-      { error: 'Guardian is unavailable. Check your API key in Vercel → Settings → Environment Variables.' },
+      { error: `Guardian error: ${message}` },
       { status: 500 }
     );
   }
